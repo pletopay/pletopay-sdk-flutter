@@ -2,8 +2,8 @@ name: pletopay_flutter
 description: Pletopay checkout for Flutter. Shows the hosted bank-transfer checkout in a WebView with completion detection, plus a headless client for the checkout session API.
 version: 1.0.0
 homepage: https://docs.pletopay.com/checkout/hosted
-repository: https://github.com/evidenze/pletopay-sdk-flutter
-issue_tracker: https://github.com/evidenze/pletopay-sdk-flutter/issues
+repository: https://github.com/pletopay/pletopay-sdk-flutter
+issue_tracker: https://github.com/pletopay/pletopay-sdk-flutter/issues
 topics:
   - payments
   - checkout
