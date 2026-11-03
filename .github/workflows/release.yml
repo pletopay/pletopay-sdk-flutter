@@ -1,0 +1,28 @@
+# Publishes to pub.dev with automated publishing (OIDC) when a vX.Y.Z tag is pushed.
+# Enable "Automated publishing from GitHub Actions" for the package on pub.dev first.
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: subosito/flutter-action@1508160852fb97248640997f7cfb38da241df0ba # v2.9.1
+        with:
+          channel: stable
+      - run: flutter pub get
+      - run: flutter analyze && flutter test
+      - name: Check the tag matches pubspec.yaml
+        run: test "v$(grep '^version:' pubspec.yaml | awk '{print $2}')" = "${GITHUB_REF_NAME}"
+      - run: dart pub publish --force
