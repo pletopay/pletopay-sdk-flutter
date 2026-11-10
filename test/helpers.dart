@@ -5,6 +5,7 @@ import 'package:http/testing.dart';
 
 const String kToken = '0OrCJ44hSQU_xb9de8Z7YiVAN01RQViC';
 
+/// A session as the checkout API presents it: `success_url` is only revealed once it is complete.
 Map<String, dynamic> sessionJson({
   String status = 'open',
   String? paymentStatus,
@@ -23,7 +24,7 @@ Map<String, dynamic> sessionJson({
       'description': null,
       'payment_status': paymentStatus,
       'bank_transfer': bankTransfer,
-      'success_url': successUrl,
+      'success_url': status == 'complete' ? successUrl : null,
       'cancel_url': cancelUrl,
       'expires_at': (expiresAt ?? DateTime.now().toUtc().add(const Duration(hours: 1))).toIso8601String(),
     };

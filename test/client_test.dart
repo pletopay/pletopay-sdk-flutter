@@ -1,6 +1,10 @@
+import 'dart:io';
+
+import 'package:clock/clock.dart';
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:pletopay_flutter/pletopay_flutter.dart';
 
 import 'helpers.dart';
@@ -39,6 +43,7 @@ void main() {
         apiError(404, 'resource_missing'),
         apiError(429, 'rate_limited'),
         http.ClientException('offline'),
+        const HandshakeException('bad certificate'), // package:http does not wrap this one
         http.Response('<html>', 502),
         http.Response('{"status":true,"message":"x"}', 200),
       ]);
@@ -60,6 +65,12 @@ void main() {
           throwsA(isA<PletopayCheckoutException>()
               .having((e) => e.code, 'code', 'network_error')
               .having((e) => e.retryable, 'retryable', true)));
+      await expectLater(
+          client.getSession(kToken),
+          throwsA(isA<PletopayCheckoutException>()
+              .having((e) => e.code, 'code', 'network_error')
+              .having((e) => e.retryable, 'retryable', true)
+              .having((e) => e.message, 'message', contains('bad certificate'))));
       await expectLater(
           client.getSession(kToken),
           throwsA(isA<PletopayCheckoutException>()
@@ -86,6 +97,7 @@ void main() {
           envelope(sessionJson()),
           envelope(sessionJson(paymentStatus: 'processing')),
           apiError(503, 'service_unavailable'),
+          const SocketException('connection reset'),
           envelope(sessionJson(status: 'complete', paymentStatus: 'succeeded')),
         ]);
         final client = PletopayCheckoutClient(apiUrl: 'http://api.test', httpClient: mock.client);
@@ -96,10 +108,10 @@ void main() {
                 interval: const Duration(milliseconds: 500),
                 onUpdate: (s) => seen.add('${s.rawStatus}/${s.paymentStatus?.name}'))
             .then((s) => last = s);
-        async.elapse(const Duration(seconds: 7));
+        async.elapse(const Duration(seconds: 9));
         expect(last?.isComplete, isTrue);
         expect(seen, ['open/null', 'open/processing', 'complete/succeeded']);
-        expect(mock.calls.length, 4); // interval was raised to the 2 s minimum
+        expect(mock.calls.length, 5); // interval was raised to the 2 s minimum
       });
     });
 
@@ -133,6 +145,81 @@ void main() {
         });
         async.elapse(const Duration(seconds: 9));
         expect(error, isA<PletopayCheckoutException>().having((e) => e.code, 'code', 'timeout'));
+      });
+    });
+
+    test('watchSession keeps polling an open session past expires_at, every 15 s, until 30 minutes after it', () {
+      fakeAsync((FakeAsync async) {
+        final expiresAt = clock.now().toUtc().add(const Duration(seconds: 10));
+        final at = <Duration>[];
+        final client = PletopayCheckoutClient(
+          apiUrl: 'http://api.test',
+          httpClient: MockClient((_) async {
+            at.add(async.elapsed);
+            return envelope(sessionJson(expiresAt: expiresAt));
+          }),
+        );
+        Object? error;
+        client.pollSession(kToken, interval: const Duration(seconds: 2)).then((_) {}, onError: (Object e) {
+          error = e;
+        });
+        const untilExpiry = Duration(seconds: 10);
+        async.elapse(untilExpiry + kPletopayPollDeadlineAfterExpiry - const Duration(seconds: 1));
+        // Every 2 s until expires_at, every 15 s from then on, and still going long after the old one-minute allowance.
+        expect(at.take(9).map((d) => d.inSeconds), [0, 2, 4, 6, 8, 10, 25, 40, 55]);
+        expect(at.last, untilExpiry + kPletopayPollDeadlineAfterExpiry - kPletopayPostExpiryPollInterval);
+        expect(error, isNull);
+        async.elapse(const Duration(seconds: 1) + kPletopayPostExpiryPollInterval);
+        expect(
+            error,
+            isA<PletopayCheckoutException>()
+                .having((e) => e.code, 'code', 'timeout')
+                .having((e) => e.retryable, 'retryable', true));
+        final polled = at.length;
+        async.elapse(const Duration(minutes: 10));
+        expect(at.length, polled);
+      });
+    });
+
+    test('watchSession returns a completion after expires_at; an explicit timeout or a slower interval wins', () {
+      fakeAsync((FakeAsync async) {
+        final expiresAt = clock.now().toUtc().add(const Duration(seconds: 10));
+        (List<Duration>, PletopayCheckoutClient) polling({Duration? completeAfter}) {
+          final at = <Duration>[];
+          final client = PletopayCheckoutClient(
+            apiUrl: 'http://api.test',
+            httpClient: MockClient((_) async {
+              at.add(async.elapsed);
+              final complete = completeAfter != null && async.elapsed >= completeAfter;
+              return envelope(sessionJson(status: complete ? 'complete' : 'open', expiresAt: expiresAt));
+            }),
+          );
+          return (at, client);
+        }
+
+        const completeAfter = Duration(minutes: 12, seconds: 10);
+        final (lateAt, late) = polling(completeAfter: completeAfter);
+        PublicCheckoutSession? completed;
+        late.pollSession(kToken, interval: const Duration(seconds: 2)).then((s) => completed = s);
+
+        final (explicitAt, explicit) = polling();
+        Object? error;
+        explicit
+            .pollSession(kToken, interval: const Duration(seconds: 2), timeout: const Duration(minutes: 1))
+            .then((_) {}, onError: (Object e) {
+          error = e;
+        });
+
+        final (slowAt, slow) = polling();
+        final sub = slow.watchSession(kToken, interval: const Duration(seconds: 20)).listen((_) {});
+
+        async.elapse(const Duration(minutes: 13, seconds: 10));
+        expect(completed?.isComplete, isTrue);
+        expect(lateAt.last, completeAfter);
+        expect(error, isA<PletopayCheckoutException>().having((e) => e.code, 'code', 'timeout'));
+        expect(explicitAt.last, lessThanOrEqualTo(const Duration(minutes: 1) + kPletopayPostExpiryPollInterval));
+        expect(slowAt.take(4).map((d) => d.inSeconds), [0, 20, 40, 60]); // a slower caller interval is kept
+        sub.cancel();
       });
     });
   });

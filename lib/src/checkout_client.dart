@@ -16,6 +16,14 @@ const String kPletopayCheckoutUrl = 'https://checkout.pletopay.com';
 /// The checkout API allows about two requests a second per device; poll no faster than this.
 const Duration kPletopayMinPollInterval = Duration(seconds: 2);
 
+/// A session can stay open for a while after its `expires_at` (a transfer sent
+/// just before the deadline is still accepted while it is confirmed) and can
+/// still become complete then. From `expires_at` on, polling slows to this interval.
+const Duration kPletopayPostExpiryPollInterval = Duration(seconds: 15);
+
+/// How long after the session's `expires_at` polling keeps waiting for a final state by default.
+const Duration kPletopayPollDeadlineAfterExpiry = Duration(minutes: 30);
+
 final RegExp _tokenPattern = RegExp(r'^[A-Za-z0-9_-]{8,64}$');
 final RegExp _hostedPath = RegExp(r'^/c/([A-Za-z0-9_-]{8,64})$');
 
@@ -83,7 +91,13 @@ class PletopayCheckoutClient {
   /// Emits the session's state every [interval] (never below 2 s) while it is
   /// open, then its final state, and completes. Cancel the subscription to stop.
   /// Pass [initial] to start from a state you already fetched. Retryable errors
-  /// (rate limit, outage) are skipped; others end the stream with an error.
+  /// (rate limit, outage, network failure) are skipped; others end the stream
+  /// with an error.
+  ///
+  /// The session stays open until Pletopay has settled whether a late transfer
+  /// arrived, so the stream keeps going past `expires_at`, every 15 s at most
+  /// from then on. It ends with a `timeout` error if the session is still open
+  /// after [timeout] (default: 30 minutes after `expires_at`).
   Stream<PublicCheckoutSession> watchSession(
     String session, {
     Duration interval = const Duration(seconds: 4),
@@ -93,16 +107,17 @@ class PletopayCheckoutClient {
     final every = interval < kPletopayMinPollInterval ? kPletopayMinPollInterval : interval;
     var current = initial ?? await getSession(session);
     yield current;
-    final deadline = clock.now().add(
-          timeout ??
-              _max(const Duration(minutes: 1), current.expiresAt.difference(clock.now()) + const Duration(minutes: 1)),
-        );
+    final started = clock.now();
+    final deadline = started.add(
+      timeout ?? _max(Duration.zero, current.expiresAt.difference(started)) + kPletopayPollDeadlineAfterExpiry,
+    );
     while (current.isOpen) {
       if (clock.now().isAfter(deadline)) {
         throw const PletopayCheckoutException('timeout', 'Gave up waiting for the checkout session to complete',
             retryable: true);
       }
-      await Future<void>.delayed(every);
+      final expired = !clock.now().isBefore(current.expiresAt);
+      await Future<void>.delayed(expired ? _max(every, kPletopayPostExpiryPollInterval) : every);
       try {
         current = await getSession(session);
       } on PletopayCheckoutException catch (error) {
@@ -146,6 +161,10 @@ class PletopayCheckoutClient {
       throw PletopayCheckoutException('timeout', '$method $path timed out', retryable: true);
     } on http.ClientException catch (error) {
       throw PletopayCheckoutException('network_error', '$method $path failed: ${error.message}', retryable: true);
+    } on Exception catch (error) {
+      // `package:http` does not wrap everything the transport throws (a TLS handshake failure, for
+      // one). Whatever it was, the request did not get an answer.
+      throw PletopayCheckoutException('network_error', '$method $path failed: $error', retryable: true);
     }
     Object? body;
     try {
